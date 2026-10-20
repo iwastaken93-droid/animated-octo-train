@@ -1,0 +1,1 @@
+local x=42 local function f(a) return a+x end return f(1)
