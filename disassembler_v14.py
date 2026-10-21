@@ -3,6 +3,7 @@
 Usage: python disassembler_v14.py fixtures/v14/trivial.luac
 """
 from __future__ import annotations
+import re
 import sys
 import opcodes_v14 as op
 import parser_v14
@@ -106,7 +107,8 @@ def fmt_const(bc: parser_v14.Bytecode, proto: parser_v14.Proto, kid: int, full: 
             parts.append(sc.value[2].decode("utf-8", "replace"))
         return ".".join(parts)
     if t in (parser_v14.LBC_CONSTANT_TABLE, parser_v14.LBC_CONSTANT_TABLE_WITH_CONSTANTS):
-        return "{...}"
+        tmpl = fmt_table_template(bc, proto, kid)
+        return tmpl if tmpl is not None else "{...}"
     if t == parser_v14.LBC_CONSTANT_CLOSURE:
         nm = _child_name(bc, v[1])
         return f"'{nm}'" if nm else ""
@@ -117,6 +119,100 @@ def fmt_const(bc: parser_v14.Bytecode, proto: parser_v14.Proto, kid: int, full: 
     if t == parser_v14.LBC_CONSTANT_CLASS_SHAPE:
         return f"classshape{list(v[1:])}"
     return f"tag{t}"
+
+
+# Luau reserved words: `name = v` record syntax is invalid for these.
+_LUAU_KEYWORDS = frozenset(
+    "and break do else elseif end false for function if in local nil not or "
+    "repeat return then true until while continue".split()
+)
+
+
+def _template_value_str(bc: parser_v14.Bytecode, proto: parser_v14.Proto, vid: int) -> tuple[bool, str]:
+    """Render one DUPTABLE template value constant.
+
+    Returns (present, text): present=False means the slot is nil and must be
+    omitted from the literal (the VM deletes nil-valued template keys).
+    Raises ValueError when the constant has no valid literal form.
+    """
+    c = proto.consts[vid]
+    t, v = c.tag, c.value
+    if t == parser_v14.LBC_CONSTANT_NIL:
+        return (False, "")
+    if t == parser_v14.LBC_CONSTANT_BOOLEAN:
+        return (True, "true" if v else "false")
+    if t == parser_v14.LBC_CONSTANT_NUMBER:
+        return (True, _fmt_num(v))
+    if t == parser_v14.LBC_CONSTANT_INTEGER:
+        return (True, str(int(v)))
+    if t == parser_v14.LBC_CONSTANT_STRING:
+        return (True, _fmt_str(v[2], full=True))
+    if t in (parser_v14.LBC_CONSTANT_VECTOR, parser_v14.LBC_CONSTANT_VECTORD):
+        fmt = "%.9g" if t == parser_v14.LBC_CONSTANT_VECTOR else "%.17g"
+        return (True, "vector.create(%s)" % _fmt_vec(v, fmt))
+    if t in (parser_v14.LBC_CONSTANT_TABLE, parser_v14.LBC_CONSTANT_TABLE_WITH_CONSTANTS):
+        inner = fmt_table_template(bc, proto, vid)
+        if inner is not None:
+            return (True, inner)
+        raise ValueError(f"nested table template K{vid} not renderable")
+    raise ValueError(f"template value K{vid} has no literal form (tag {t})")
+
+
+def fmt_table_template(bc: parser_v14.Bytecode, proto: parser_v14.Proto, kid: int) -> str | None:
+    """Render a DUPTABLE template constant as a valid Luau table literal.
+
+    Mirrors lvmload.cpp: WITH_CONSTANTS pre-fills each pair (nil values are
+    omitted, negative value indices mean 0); plain TABLE pre-fills every key
+    with 0. Returns None when any key/value has no literal form -- the caller
+    must fall back (and document the loss). The reference compiler only emits
+    string keys and scalar/vector values here, so None means exotic input.
+    """
+    try:
+        c = proto.consts[kid]
+    except IndexError:
+        return None
+    t, v = c.tag, c.value
+    try:
+        if t == parser_v14.LBC_CONSTANT_TABLE:
+            pairs = [(k, -1) for k in v[1]]
+        elif t == parser_v14.LBC_CONSTANT_TABLE_WITH_CONSTANTS:
+            pairs = list(v[1])
+        else:
+            return None
+        parts: list[str] = []
+        for kk, vv in pairs:
+            try:
+                kc = proto.consts[kk]
+            except IndexError:
+                return None
+            if kc.tag == parser_v14.LBC_CONSTANT_STRING:
+                raw = kc.value[2].decode("utf-8", "replace")
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", raw) and raw not in _LUAU_KEYWORDS:
+                    prefix = f"{raw} = "
+                else:
+                    prefix = f"[{_fmt_str(kc.value[2], full=True)}] = "
+            else:
+                # defensive: the compiler only emits string keys here, but
+                # `[expr] = v` stays valid for any renderable key const.
+                try:
+                    key_text = fmt_const(bc, proto, kk, full=True)
+                except Exception:
+                    return None
+                if key_text.startswith("{") or "(" in key_text:
+                    return None
+                prefix = f"[{key_text}] = "
+            if vv is None or (isinstance(vv, int) and vv < 0):
+                parts.append(f"{prefix}0")
+                continue
+            try:
+                present, text = _template_value_str(bc, proto, vv)
+            except (IndexError, ValueError):
+                return None
+            if present:
+                parts.append(f"{prefix}{text}")
+        return "{" + ", ".join(parts) + "}"
+    except (IndexError, ValueError):
+        return None
 
 
 def _target(insns: list, idx: int) -> int | None:

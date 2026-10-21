@@ -1,8 +1,11 @@
 # Known limitations
 
 This file records bytecode patterns the decompiler deliberately does not
-translate into valid Luau, with the reason for each. The validity gate
-(`valid_check.py`) counts these as `excluded`, not failures.
+translate into valid Luau, with the reason for each, plus-differential
+harness skips that are not decompiler failures. The validity gate
+(`valid_check.py`) counts untranslatable protos as `excluded`, not
+failures. Current corpus: 32 files, 85 protos, 0 `goto_edges`,
+0 unclassified loops.
 
 ## 1. Multret `SETLIST` (dynamic-count table fill)
 
@@ -46,12 +49,39 @@ interaction with prior batches have not been proven equivalent; see
 ## 2. Goto/label leftovers (irreducible control flow)
 
 **Status:** none in the current corpus (0 total `goto_edges` across all
-82 protos). Documented for completeness: if loop detection ever leaves
+85 protos). Documented for completeness: if loop detection ever leaves
 a join that is neither a loop exit nor a structured branch, the emitter
 keeps `goto`/`L:` lines and marks the proto excluded rather than
 emitting silently-wrong code. The `while true` + `if _pc == N` dispatcher
 covers irreducible *non-FOR* flow; FOR loops containing irreducible flow
 stay excluded because `for` init semantics cannot be re-entered.
+
+## 3. Harness skip: `iter_range` (cross-proto reference)
+
+**Status:** skipped by the differential harness, not a decompiler
+failure. The `iter_range` fixture references another proto (`P[0]`) that
+has no standalone runtime form, so the harness cannot execute the
+original for comparison. The proto itself structures and parses cleanly.
+If the harness ever gains linked-proto execution, this skip should be
+revisited.
+
+## 4. Resolved issues (regression-pinned, not limitations)
+
+These were real bugs, now fixed and covered so they stay fixed:
+
+- **Outer-latch `break` vs `continue`:** a branch from an inner loop
+  body directly to an outer loop's latch block must decompile to
+  `break` (inner), not `continue` — `continue` would only skip one
+  iteration and silently compute a wrong sum. Both compiler shapes are
+  pinned by `fixtures/v14/edge/latch_break.luau`: *fused* (inner exit
+  IS the latch block) and *bypass* (inner exit jumps to the latch
+  block while the `for` sits in a non-final dispatch branch, so its
+  end-label must jump over the `else` code). Guards are non-monotonic
+  (`i == 5`, `i == 7`) so a `continue`/`break` mixup changes the
+  numeric result and the differential harness catches it.
+- **`DUPTABLE` template emission:** template constants render as table
+  literals (`disassembler_v14._fmt_duptable`, inlined by `ir_v14`);
+  covered by the `iter_main` differential test.
 
 ## Proving a fix
 

@@ -3,8 +3,9 @@
 For each covered proto this builds a Luau driver that loads the ORIGINAL
 function (from the fixture .luau source) and the DECOMPILED function
 (emitted by emit_proto), calls both with identical arguments, and
-deep-compares results (NaN-aware; error-vs-error counts as equal, error
-text is ignored since it embeds source positions).
+deep-compares results (NaN-aware; error-vs-error counts as equal only
+when the messages match after stripping the `file:line: ` position
+prefix, which necessarily differs between the two sources).
 
 Run:  python diff_harness.py [path/to/luau]   (default: C:/luau-build/luau.exe)
 Exit 1 on any mismatch or VM failure. Cases that cannot run standalone
@@ -118,9 +119,25 @@ end
 local function _packcall(f, argv)
   return table.pack(pcall(f, table.unpack(argv, 1, argv.n)))
 end
+local function _normerr(e)
+  return (tostring(e):gsub("^.-:%d+: ", ""))
+end
 local function _cmp(ra, rb)
   if ra[1] ~= rb[1] then return false, "ok-flag" end
-  if not ra[1] then return true end
+  if not ra[1] then
+    -- both sides raised: the fault must be the same fault. Position
+    -- prefixes (`file:line: `) necessarily differ, so compare the
+    -- message text after stripping them. Non-string error values
+    -- (e.g. error(tbl)) compare structurally; tostring on tables
+    -- embeds a nondeterministic address.
+    local ea, eb = ra[2], rb[2]
+    if type(ea) == "string" and type(eb) == "string" then
+      if _normerr(ea) ~= _normerr(eb) then return false, "error-text" end
+      return true
+    end
+    if not _eq(ea, eb, 0) then return false, "error-value" end
+    return true
+  end
   if ra.n ~= rb.n then return false, "arity" end
   for i = 2, ra.n do
     if not _eq(ra[i], rb[i], 0) then return false, "result" end
@@ -314,6 +331,16 @@ CASES = [
          calls=[[17, 5], [0, 1], [-3, 7], [2.5, 0.5]],
          mode="std",
          globals="if type(vector) == 'table' and type(vector.create) == 'function' then local _vt = vector vector = setmetatable({}, {__index = _vt, __call = function(_, x, y, z) return _vt.create(x, y, z) end}) end"),
+    dict(name="latch_fused", luac="fixtures/v14/edge/latch_break.luac", pid=0,
+         fixture="fixtures/v14/edge/latch_break.luau",
+         suffix="",
+         calls=[[10], [3], [5]],
+         mode="std", globals="", orig_fn="fused"),
+    dict(name="latch_bypass", luac="fixtures/v14/edge/latch_break.luac", pid=1,
+         fixture="fixtures/v14/edge/latch_break.luau",
+         suffix="",
+         calls=[[10, 2], [6, 2], [4, 0], [3, 1]],
+         mode="std", globals="", orig_fn="bypass"),
 ]
 
 

@@ -23,7 +23,7 @@ import opcodes_v14 as op
 import parser_v14
 from cfg_v14 import decode, CFGError
 from disassembler_v14 import DisasmError
-from disassembler_v14 import fmt_const
+from disassembler_v14 import fmt_const, fmt_table_template
 
 
 class IRError(Exception):
@@ -287,9 +287,20 @@ class Lifter:
         return {r for r, c in counts.items() if c > 1}
 
     def _at_label(self, pc: int) -> None:
-        """Entering a join point: drop stale folds for reused registers."""
+        """Entering a join point: drop stale folds for reused registers,
+        plus every cached expr that reads them. A surviving expr would
+        re-render with the MERGED value on a later fold (e.g. `R9 = R8`
+        kept across a join that redefines R8); the defining statement
+        fixed the old meaning in place, so afterwards only the plain
+        register stays valid. Single-def exprs that read nothing
+        clobbered here are kept."""
         for r in self._multidef:
             self.env.pop(r, None)
+        if self.env:
+            multi = self._multidef
+            for r in [r for r, old in self.env.items()
+                      if any(_mentions_reg(old, d) for d in multi)]:
+                self.env.pop(r, None)
         self._last_multret = None  # joins merge tops; chains don't survive
 
     def _lab(self, pc: int) -> str:
@@ -330,6 +341,23 @@ class Lifter:
             return e
         return _leaf("reg", f"R{reg}")
 
+    def _clobber(self, reg: int) -> None:
+        """R{reg} is rebound: drop its cached expr and every cached expr
+        that reads it. Registers are mutable, so a surviving expr would
+        re-render with the NEW value on a later fold (e.g. `R4 = R5 .. R6`
+        kept across `R5 = print` folds to `print .. ...`). The defining
+        statement already fixed the old meaning in place; afterwards only
+        the plain register stays valid. (Table-mutation ops like SETTABLE
+        do NOT clobber: the register still holds the same table.)"""
+        self.env.pop(reg, None)
+        for r in [r for r, old in self.env.items() if _mentions_reg(old, reg)]:
+            self.env.pop(r, None)
+        # any redefinition kills a pending constructor merge...
+        # (...except the NEWTABLE site itself, which re-arms below).
+        # Dependents keep their own ctor state: their table is unchanged.
+        self._last_ctor.pop(reg, None)
+        self._chain_invalidate_from(reg)
+
     def _def(self, reg: int, e: Expr) -> None:
         if e.depth > _MAX_DEPTH:
             e = _leaf("reg", f"R{reg}")
@@ -339,11 +367,8 @@ class Lifter:
             # read the plain register. Re-expanding the defining
             # expression at a later use would apply the update twice.
             e = _leaf("reg", f"R{reg}")
+        self._clobber(reg)
         self.env[reg] = e
-        # any redefinition kills a pending constructor merge...
-        # (...except the NEWTABLE site itself, which re-arms below)
-        self._last_ctor.pop(reg, None)
-        self._chain_invalidate_from(reg)
 
     def _emit(self, text: str) -> None:
         self.res.lines.append(text)
@@ -400,20 +425,17 @@ class Lifter:
             return call_text  # 0 results: bare call (top untouched)
         if C == 0:
             # multret results from A to top
-            self.env.pop(A, None)
-            self._last_ctor.pop(A, None)
+            self._clobber(A)
             for r in list(self.env):
                 if r > A:
-                    self.env.pop(r, None)
-                    self._last_ctor.pop(r, None)
+                    self._clobber(r)
             # straight-line chain head for a following multret consumer
             self._last_multret = {"text": call_text, "start": A,
                                   "pc": ins.pc, "kind": "call"}
             return f"R{A}..top = {call_text}"
         regs = ", ".join(f"R{r}" for r in range(A, A + C - 1))
         for r in range(A, A + C - 1):
-            self.env.pop(r, None)
-            self._last_ctor.pop(r, None)
+            self._clobber(r)
         # fixed result count resets the stack top: chain broken
         self._last_multret = None
         # record first result as the call expr for folding? Calls have side
@@ -625,9 +647,7 @@ class Lifter:
                 # model: R[A]=func value, R[A+1]=self. R[A] keeps the raw
                 # register (rendering `X:m` as a plain value would be invalid
                 # code); R[A+1] aliases the object for folding.
-                self.env.pop(A, None)
-                self._last_ctor.pop(A, None)
-                self._chain_invalidate_from(A)
+                self._clobber(A)
                 self._def(A + 1, obj)
                 self.res.suppressed.add(ins.pc)
                 if ins.pc in self._labels:
@@ -749,8 +769,21 @@ class Lifter:
                 self._last_ctor[A] = ins.pc
                 i += 1; continue
             if n == "DUPTABLE":
-                e = _leaf("table", f"dup {self._const(D).render()}")
-                self._def(A, e); self._op(ins, f"R{A} = {{}}  -- dup K{D}"); i += 1; continue
+                # Emit the template as a real literal (`{a = 1, ...}`), not
+                # `{}`: the VM pre-fills template keys (lvmload.cpp), so an
+                # empty literal silently changes pairs/next iteration and any
+                # read of template keys. Plain-TABLE templates pre-fill 0.
+                tmpl = fmt_table_template(self.bc, self.proto, D)
+                if tmpl is None:
+                    # exotic template (never emitted by the reference
+                    # compiler: string keys + scalar/vector values only).
+                    # Stay valid; the value loss is documented in LIMITATIONS.
+                    tmpl = "{}"
+                    suffix = f"  -- dup K{D} (template not representable)"
+                else:
+                    suffix = f"  -- dup K{D}"
+                e = _leaf("table", tmpl)
+                self._def(A, e); self._op(ins, f"R{A} = {tmpl}{suffix}"); i += 1; continue
             if n == "DUPCLOSURE":
                 e = _leaf("closure", f"dupclosure {self._const(D).render()}")
                 self._def(A, e); self._op(ins, f"R{A} = dupclosure {self._const(D).render()}"); i += 1; continue
@@ -802,8 +835,7 @@ class Lifter:
             if n == "GETVARARGS":
                 if B == 0:
                     for r in range(A, 255):
-                        self.env.pop(r, None)
-                        self._last_ctor.pop(r, None)
+                        self._clobber(r)
                     self._last_multret = {"text": "...", "start": A,
                                           "pc": ins.pc, "kind": "dots"}
                     self._op(ins, f"R{A}..top = ..."); i += 1; continue
