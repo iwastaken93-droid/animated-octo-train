@@ -65,6 +65,14 @@ DRIVER_TMPL = """-- differential driver for CASE_NAME (proto PID of LUAC_FILE)
 local _real_print = print
 print = function(...) end
 EXTRA_GLOBALS
+local _cap = {}
+print = function(...)
+  local parts = {}
+  for i = 1, select("#", ...) do
+    parts[i] = tostring(select(i, ...))
+  end
+  _cap[#_cap + 1] = table.concat(parts, "\\t")
+end
 local __orig_src = ORIG_QUOTED
 local __orig_chunk, __load_err = loadstring(__orig_src .. ORIG_SUFFIX_QUOTED)
 if not __orig_chunk then
@@ -119,14 +127,6 @@ local function _cmp(ra, rb)
   end
   return true
 end
-local _cap = {}
-print = function(...)
-  local parts = {}
-  for i = 1, select("#", ...) do
-    parts[i] = tostring(select(i, ...))
-  end
-  _cap[#_cap + 1] = table.concat(parts, "\\t")
-end
 local _ncalls = 0
 local _nfail = 0
 local _norigok = 0
@@ -145,6 +145,7 @@ local function _fresh(a)
   return o
 end
 
+_cap = {}
 CALL_LOOP
 print = _real_print
 _real_print(string.format("DIFFCASE CASE_NAME done calls=%d fails=%d origok=%d", _ncalls, _nfail, _norigok))
