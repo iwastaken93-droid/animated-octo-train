@@ -17,6 +17,7 @@ Usage:
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
+import re
 import sys
 import opcodes_v14 as op
 import parser_v14
@@ -120,11 +121,11 @@ class Expr:
             return self.text
         if k == "index":
             o, idx = self.kids
-            return f"{o.render(_P_ATOM)}[{idx.render()}]"
+            return f"{_recv(o, o.render(_P_ATOM))}[{idx.render()}]"
         if k == "indexk":
-            return f"{self.kids[0].render(_P_ATOM)}.{self.text}"
+            return f"{_recv(self.kids[0], self.kids[0].render(_P_ATOM))}.{self.text}"
         if k == "indexn":
-            return f"{self.kids[0].render(_P_ATOM)}[{self.text}]"
+            return f"{_recv(self.kids[0], self.kids[0].render(_P_ATOM))}[{self.text}]"
         if k == "unop":
             operand = self.kids[0].render(_P_UN)
             s = f"{self.text} {operand}" if self.text == "not" else f"{self.text}{operand}"
@@ -142,7 +143,8 @@ class Expr:
             return f"{f}({', '.join(a.render() for a in args)})"
         if k == "method":
             obj, args = self.kids[0], self.kids[1:]
-            return f"{obj.render(_P_ATOM)}:{self.text}({', '.join(a.render() for a in args)})"
+            base = _recv(obj, obj.render(_P_ATOM))
+            return f"{base}:{self.text}({', '.join(a.render() for a in args)})"
         if k == "funcval":
             # bare function value used as a statement callee later; render callee
             return self.text
@@ -163,6 +165,24 @@ def _node(kind: str, text: str, kids: tuple) -> Expr:
 
 def _bin(o: str, l: Expr, r: Expr) -> Expr:
     return _node("binop", o, (l, r))
+
+
+def _mentions_reg(e: Expr, reg: int) -> bool:
+    """Whether expression tree e reads R{reg} (tree walk, not text)."""
+    if e.kind == "reg" and e.text == f"R{reg}":
+        return True
+    return any(_mentions_reg(c, reg) for c in e.kids)
+
+
+# expression kinds that are not valid method/index receivers without parens
+# (literals, table constructors, `...`, stale method values)
+_NEEDS_RECV_PARENS = {"const", "table", "dots", "funcval"}
+
+
+def _recv(e: Expr, rendered: str) -> str:
+    if e.kind in _NEEDS_RECV_PARENS:
+        return f"({rendered})"
+    return rendered
 
 
 def _un(o: str, v: Expr) -> Expr:
@@ -197,9 +217,15 @@ class Lifter:
         self.env: dict[int, Expr] = {}
         self.res = LiftResult()
         self._multidef = self._find_multidef()
+        self._last_ctor: dict[int, int] = {}  # reg -> NEWTABLE pc (for SETLIST merge)
         self._pending_fastcall: dict | None = None   # {id, args, target, pc}
         self._fallback: dict | None = None           # {pc, expr} suppressed loader
         self._pending_namecall: dict | None = None   # {obj, method, dest}
+        self._last_multret: dict | None = None       # {text, start, pc, kind}
+        # straight-line multret chain: a C==0 CALL / B==0 GETVARARGS leaves
+        # its results on top; a following B==0 consumer forwards them. Nest
+        # the producer text (`f(g(...))`) instead of emitting `...multret...`.
+        # Cleared by joins (labels), clobbers, and single-shot use.
         self._labels: dict[int, int] = {}
         self._build_labels()
 
@@ -227,6 +253,26 @@ class Lifter:
     def _find_multidef(self) -> set[int]:
         counts: dict[int, int] = {}
         for ins in self.insns:
+            # loop ops implicitly redefine their control/output window
+            # every iteration; without this the flow-insensitive env folds
+            # pre-loop values into loop bodies (e.g. `print(1)` for print(i)).
+            # Over-marking is safe (just folds less).
+            if ins.opname in ("FORNPREP", "FORNLOOP"):
+                for r in range(ins.A, ins.A + 4):
+                    counts[r] = counts.get(r, 0) + 1
+                continue
+            if ins.opname == "FORGLOOP":
+                # outputs are R[A+3 .. A+3+N-1] (N = aux low byte); the VM
+                # also writes R[A+2] (index copy). Derive the exact window
+                # from this insn's own aux instead of a fixed guess.
+                n = (ins.aux & 0xFF) if ins.aux else 0
+                for r in range(ins.A, ins.A + 3 + max(n, 1)):
+                    counts[r] = counts.get(r, 0) + 1
+                continue
+            if ins.opname in ("FORGPREP", "FORGPREP_NEXT", "FORGPREP_INEXT"):
+                for r in range(ins.A, ins.A + 3):
+                    counts[r] = counts.get(r, 0) + 1
+                continue
             if ins.opname in self._SRC_A:
                 continue
             if ins.opname in ("CALL", "CALLFB"):
@@ -244,19 +290,20 @@ class Lifter:
         """Entering a join point: drop stale folds for reused registers."""
         for r in self._multidef:
             self.env.pop(r, None)
+        self._last_multret = None  # joins merge tops; chains don't survive
 
     def _lab(self, pc: int) -> str:
         return f"L{self._labels[pc]}"
 
     def _const(self, kid: int) -> Expr:
         try:
-            return _leaf("const", fmt_const(self.bc, self.proto, kid))
+            return _leaf("const", fmt_const(self.bc, self.proto, kid, full=True))
         except Exception:
             return _leaf("const", f"K{kid}")
 
     def _import_path(self, kid: int) -> str:
         try:
-            return fmt_const(self.bc, self.proto, kid)
+            return fmt_const(self.bc, self.proto, kid, full=True)
         except Exception:
             return f"K{kid}"
 
@@ -275,6 +322,9 @@ class Lifter:
         exponentially re-expanded tree. Table leaves never substitute:
         `{}` is a heap identity, re-rendering it per use would imply
         distinct tables."""
+        # any read of a pending-ctor table vetoes the SETLIST merge: the
+        # read observes the table before the fill in original order
+        self._last_ctor.pop(reg, None)
         e = self.env.get(reg)
         if e is not None and e.depth <= 2 and e.kind != "table":
             return e
@@ -283,7 +333,17 @@ class Lifter:
     def _def(self, reg: int, e: Expr) -> None:
         if e.depth > _MAX_DEPTH:
             e = _leaf("reg", f"R{reg}")
+        elif _mentions_reg(e, reg):
+            # Self-referential fold (e.g. `R7 = R7 + 2`): the emitted
+            # statement already performs the update, so later uses must
+            # read the plain register. Re-expanding the defining
+            # expression at a later use would apply the update twice.
+            e = _leaf("reg", f"R{reg}")
         self.env[reg] = e
+        # any redefinition kills a pending constructor merge...
+        # (...except the NEWTABLE site itself, which re-arms below)
+        self._last_ctor.pop(reg, None)
+        self._chain_invalidate_from(reg)
 
     def _emit(self, text: str) -> None:
         self.res.lines.append(text)
@@ -307,25 +367,75 @@ class Lifter:
             return [self._use(r) for r in range(first, 255) if r in self.env or r < first + 0], True
         return [self._use(r) for r in range(first, first + count)], False
 
+    def _chain_invalidate_from(self, start: int) -> None:
+        ch = self._last_multret
+        if ch is not None and start >= ch["start"]:
+            self._last_multret = None
+
+    def _suppress_pc(self, pc: int) -> None:
+        """Blank an already-emitted pc (multret producer nested into its
+        consumer: keeps single evaluation). Drops its res.lines entry."""
+        lines = self.res.pc_lines.get(pc, [])
+        if not lines:
+            return
+        self.res.pc_lines[pc] = []
+        self.res.suppressed.add(pc)
+        doomed = set(lines)
+        removed: set[str] = set()
+        for li in range(len(self.res.lines) - 1, -1, -1):
+            l = self.res.lines[li]
+            m = re.match(r"^(L\d+: )(.*)$", l)
+            body = m.group(2) if m else l
+            if body in doomed and body not in removed:
+                removed.add(body)
+                del self.res.lines[li]
+                if len(removed) == len(doomed):
+                    break
+
     def _fmt_call_results(self, ins, call_text: str) -> str:
         """CALL/CALLFB result assignment rendering. Returns full statement."""
         A, B, C = ins.A, ins.B, ins.C
         nargs = B - 1
         if C == 1:
-            return call_text  # 0 results: bare call
+            return call_text  # 0 results: bare call (top untouched)
         if C == 0:
             # multret results from A to top
             self.env.pop(A, None)
+            self._last_ctor.pop(A, None)
             for r in list(self.env):
                 if r > A:
                     self.env.pop(r, None)
+                    self._last_ctor.pop(r, None)
+            # straight-line chain head for a following multret consumer
+            self._last_multret = {"text": call_text, "start": A,
+                                  "pc": ins.pc, "kind": "call"}
             return f"R{A}..top = {call_text}"
         regs = ", ".join(f"R{r}" for r in range(A, A + C - 1))
         for r in range(A, A + C - 1):
             self.env.pop(r, None)
+            self._last_ctor.pop(r, None)
+        # fixed result count resets the stack top: chain broken
+        self._last_multret = None
         # record first result as the call expr for folding? Calls have side
         # effects; keep result regs opaque (no fold) to stay sound.
         return f"{regs} = {call_text}"
+
+    def _consume_multret(self, base: int) -> str | None:
+        """Nestable multret arg/return span starting at register `base`.
+        Returns the arg text (fixed head regs + producer), or None when the
+        straight-line chain is broken (caller emits a width marker instead).
+        A nested call producer is suppressed (single evaluation); `...`
+        producers are pure reads and stay. Single-shot for non-chaining
+        consumers (a bare/fixed consumer doesn't extend the chain)."""
+        ch = self._last_multret
+        if ch is None or ch["start"] < base:
+            return None
+        head = [self._use(r).render() for r in range(base, ch["start"])]
+        parts = head + [ch["text"]]
+        if ch["kind"] == "call":
+            self._suppress_pc(ch["pc"])
+            self._last_multret = None
+        return ", ".join(parts)
 
     def _lift_call(self, ins, idx: int) -> None:
         A, B, C = ins.A, ins.B, ins.C
@@ -335,6 +445,14 @@ class Lifter:
             nc = self._pending_namecall
             self._pending_namecall = None
             if nargs < 0:
+                nested = self._consume_multret(A + 2)
+                obj = nc["obj"]
+                if nested is not None:
+                    obj_s = _recv(obj, obj.render(_P_ATOM))
+                    stmt = self._fmt_call_results(
+                        ins, f"{obj_s}:{nc['method']}({nested})")
+                    self._op(ins, f"{stmt}  -- {nc['methodname']} method")
+                    return
                 argstr = f"{', '.join([f'R{r}' for r in range(A + 2, A + 6)])}..., ..." \
                     if False else "R{A+1}..top"
                 args = "...multret..."
@@ -359,7 +477,8 @@ class Lifter:
             # plain FASTCALL: args live in the CALL's registers
             if fc["plain"]:
                 if nargs < 0:
-                    args_s = "..."
+                    nested = self._consume_multret(A + 1)
+                    args_s = nested if nested is not None else f"...multret@{A + 1}..."
                 else:
                     arg_exprs = [self._use(r) for r in range(A + 1, A + 1 + nargs)] if nargs > 0 else []
                     args_s = ", ".join(a.render() for a in arg_exprs)
@@ -369,9 +488,16 @@ class Lifter:
             self._op(ins, self._fmt_call_results(ins, call_e) + "  -- fastcall")
             return
         # plain call
-        f = self._use(A).render(_P_ATOM)
+        fu = self._use(A)
+        # a stale NAMECALL value is still just the function in R[A];
+        # rendering its `X:m` fiction as a callee would be invalid code
+        f = f"R{A}" if fu.kind == "funcval" else fu.render(_P_ATOM)
         if nargs < 0:
-            call_e = f"{f}(...multret...)"
+            nested = self._consume_multret(A + 1)
+            if nested is None:
+                call_e = f"{f}(...multret@{A + 1}...)"
+            else:
+                call_e = f"{f}({nested})"
         else:
             arg_exprs = [self._use(r) for r in range(A + 1, A + 1 + nargs)] if nargs > 0 else []
             call_e = f"{f}({', '.join(a.render() for a in arg_exprs)})"
@@ -384,6 +510,7 @@ class Lifter:
 
     def _op_fallback(self, fb: dict) -> None:
         ins = fb["ins"]
+        self._chain_invalidate_from(fb.get("reg", 999))
         self._op(ins, f"{fb['text']}  -- fallback")
 
     # -- main ------------------------------------------------------------
@@ -417,9 +544,10 @@ class Lifter:
                 if 0 <= child < len(self.bc.protos):
                     d = self.bc.protos[child].debugname
                     dn = d.decode("utf-8", "replace") if isinstance(d, bytes) else (d or "")
-                e = _leaf("closure", f"function P{child}({dn}){cap_s}")
+                # expression form must stay parseable: bare proto ref + info comment
+                e = _leaf("closure", f"P{child}")
                 self._def(A, e)
-                self._op(ins, f"R{A} = function P{child}({dn}){cap_s}")
+                self._op(ins, f"R{A} = P{child}  -- function P{child}({dn}){cap_s}")
                 for k in range(i + 1, j):
                     self.res.suppressed.add(insns[k].pc)
                 i = j
@@ -494,8 +622,12 @@ class Lifter:
                 obj = self._use(B)
                 self._pending_namecall = {"obj": obj, "method": mname,
                                           "methodname": mname, "dest": A}
-                # model: R[A]=func value, R[A+1]=self
-                self._def(A, _leaf("funcval", f"{obj.render(_P_ATOM)}:{mname}"))
+                # model: R[A]=func value, R[A+1]=self. R[A] keeps the raw
+                # register (rendering `X:m` as a plain value would be invalid
+                # code); R[A+1] aliases the object for folding.
+                self.env.pop(A, None)
+                self._last_ctor.pop(A, None)
+                self._chain_invalidate_from(A)
                 self._def(A + 1, obj)
                 self.res.suppressed.add(ins.pc)
                 if ins.pc in self._labels:
@@ -550,7 +682,8 @@ class Lifter:
             if n == "SETUPVAL":
                 self._op(ins, f"{self._upval(B).render()} = {self._use(A).render()}"); i += 1; continue
             if n == "CLOSEUPVALS":
-                self._op(ins, f"close R{A}..  -- close upvals"); i += 1; continue
+                # no Luau statement; scope end handles it. comment keeps pc covered
+                self._op(ins, f"-- close R{A}.. (upvalues leave scope)"); i += 1; continue
             if n == "GETIMPORT":
                 e = _leaf("import", self._import_path(D)); self._def(A, e)
                 self._op(ins, f"R{A} = {e.render()}"); i += 1; continue
@@ -612,7 +745,9 @@ class Lifter:
             if n == "NEWTABLE":
                 arr = aux or 0
                 e = _leaf("table", "{}")
-                self._def(A, e); self._op(ins, f"R{A} = {{}}  -- array {arr}"); i += 1; continue
+                self._def(A, e); self._op(ins, f"R{A} = {{}}  -- array {arr}")
+                self._last_ctor[A] = ins.pc
+                i += 1; continue
             if n == "DUPTABLE":
                 e = _leaf("table", f"dup {self._const(D).render()}")
                 self._def(A, e); self._op(ins, f"R{A} = {{}}  -- dup K{D}"); i += 1; continue
@@ -622,15 +757,55 @@ class Lifter:
             if n == "SETLIST":
                 count = C - 1
                 if C == 0:
-                    rhs, nnote = "...multret...", "multret"
-                else:
-                    regs = [self._use(r).render() for r in range(B, B + count)] if count > 0 else []
-                    rhs, nnote = "{" + ", ".join(regs) + "}", str(count)
-                self._op(ins, f"R{A}[{aux}..] = {rhs}  -- setlist {nnote}"); i += 1; continue
+                    # dynamic-count setlist has no valid Luau form; keep the
+                    # marker honest (validity gate excludes these protos)
+                    self._op(ins, f"R{A}[{aux}..] = ...multret...  -- setlist multret"); i += 1; continue
+                regs = [self._use(r).render() for r in range(B, B + count)] if count > 0 else []
+                rhs = "{" + ", ".join(regs) + "}"
+                # constructor merge: `R{A} = {}` ... `SETLIST @1` folds to
+                # `R{A} = {...}` (valid + readable). Safe only when no other
+                # def of R{A} intervened (tracked via _last_ctor) and values
+                # carry no register reads that the merge would move earlier.
+                merged = False
+                if (aux == 1 and ins.pc not in self._labels
+                        and self._last_ctor.get(A) is not None
+                        and not re.search(r"R\d+", rhs)):
+                    nt_pc = self._last_ctor[A]
+                    # a join between the NEWTABLE and here could skip the
+                    # constructor while still reaching the fill: don't merge
+                    between = [lp for lp in self._labels if nt_pc < lp < ins.pc]
+                    old = self.res.pc_lines.get(nt_pc, [])
+                    if (not between and len(old) == 1
+                            and re.match(rf"^R{A} = \{{\}}", old[0])):
+                        newln = f"R{A} = {rhs}"
+                        old[0] = newln
+                        for li in range(len(self.res.lines) - 1, -1, -1):
+                            l = self.res.lines[li]
+                            m = re.match(r"^(L\d+: )(.*)$", l)
+                            body = m.group(2) if m else l
+                            if re.match(rf"^R{A} = \{{\}}", body):
+                                self.res.lines[li] = (m.group(1) if m else "") + newln
+                                merged = True
+                                break
+                    # consume the pending ctor either way: reusing the
+                    # rewritten line for a later SETLIST would be wrong
+                    self._last_ctor.pop(A, None)
+                if merged:
+                    self.res.suppressed.add(ins.pc)
+                    self.res.covered.add(ins.pc)
+                    self.res.pc_lines[ins.pc] = []
+                    i += 1
+                    continue
+                self._op(ins, f"R{A} = table.move({rhs}, 1, {count}, {aux}, R{A})  -- setlist {count}")
+                i += 1
+                continue
             if n == "GETVARARGS":
                 if B == 0:
                     for r in range(A, 255):
                         self.env.pop(r, None)
+                        self._last_ctor.pop(r, None)
+                    self._last_multret = {"text": "...", "start": A,
+                                          "pc": ins.pc, "kind": "dots"}
                     self._op(ins, f"R{A}..top = ..."); i += 1; continue
                 regs = ", ".join(f"R{r}" for r in range(A, A + B - 1))
                 for r in range(A, A + B - 1):
@@ -649,7 +824,11 @@ class Lifter:
                     A2, B2, C2 = A, B, C
                     nargs2 = B2 - 1
                     if nargs2 < 0:
-                        call_e = f"{fc['override']}(...multret...)"
+                        nested = self._consume_multret(A2 + 1)
+                        if nested is None:
+                            call_e = f"{fc['override']}(...multret@{A2 + 1}...)"
+                        else:
+                            call_e = f"{fc['override']}({nested})"
                     else:
                         arg_exprs = [self._use(r) for r in range(A2 + 1, A2 + 1 + nargs2)] if nargs2 > 0 else []
                         call_e = f"{fc['override']}({', '.join(a.render() for a in arg_exprs)})"
@@ -663,7 +842,11 @@ class Lifter:
                 continue
             if n == "RETURN":
                 if B == 0:
-                    self._op(ins, f"return R{A}..top")
+                    nested = self._consume_multret(A)
+                    if nested is None:
+                        self._op(ins, f"return R{A}..top")
+                    else:
+                        self._op(ins, f"return {nested}")
                 elif B == 1:
                     self._op(ins, "return")
                 else:

@@ -32,11 +32,33 @@ def split(code: list[int]) -> list[tuple[int, str, int, int | None]]:
     return out
 
 
-def _fmt_str(bs: bytes) -> str:
+def _fmt_str(bs: bytes, full: bool = False) -> str:
+    """Render a string constant. full=True emits the complete literal with
+    escapes (for decompiled code); full=False abbreviates past 32 chars
+    (readable disassembly only -- never valid code)."""
     try:
         s = bs.decode("utf-8")
     except Exception:
-        return repr(bs)
+        s = bs.decode("utf-8", errors="replace")
+    if full:
+        out = []
+        for ch in s:
+            o = ord(ch)
+            if ch == "'":
+                out.append("\\'")
+            elif ch == "\\":
+                out.append("\\\\")
+            elif ch == "\n":
+                out.append("\\n")
+            elif ch == "\r":
+                out.append("\\r")
+            elif ch == "\t":
+                out.append("\\t")
+            elif o < 32 or o == 127:
+                out.append(f"\\x{o:02X}")
+            else:
+                out.append(ch)
+        return "'" + "".join(out) + "'"
     if all(ord(ch) >= 32 or ch in "\t" for ch in s):
         return f"'{s}'" if len(s) < 32 else f"'{s[:32]}'..."
     return "'" + "".join(f"\\x{ord(ch):02X}" if ord(ch) < 32 else ch for ch in s[:32]) + ("'..." if len(s) >= 32 else "'")
@@ -63,7 +85,7 @@ def _child_name(bc: parser_v14.Bytecode, fid: int) -> str:
     return f"#{fid}"
 
 
-def fmt_const(bc: parser_v14.Bytecode, proto: parser_v14.Proto, kid: int) -> str:
+def fmt_const(bc: parser_v14.Bytecode, proto: parser_v14.Proto, kid: int, full: bool = False) -> str:
     c = proto.consts[kid]
     t, v = c.tag, c.value
     if t == parser_v14.LBC_CONSTANT_NIL:
@@ -75,7 +97,7 @@ def fmt_const(bc: parser_v14.Bytecode, proto: parser_v14.Proto, kid: int) -> str
     if t == parser_v14.LBC_CONSTANT_INTEGER:
         return str(v)
     if t == parser_v14.LBC_CONSTANT_STRING:
-        return _fmt_str(v[2])
+        return _fmt_str(v[2], full)
     if t == parser_v14.LBC_CONSTANT_IMPORT:
         _, iid, (count, id0, id1, id2) = v
         parts = []
