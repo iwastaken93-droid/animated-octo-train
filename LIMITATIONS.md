@@ -86,7 +86,7 @@ These were real bugs, now fixed and covered so they stay fixed:
 ## Proving a fix
 
 Any new compilation for section 1 must (a) keep `valid_check.py` green,
-(b) keep `struct_check_tmp.py` and `quality_check.py` green, and
+(b) keep `struct_check.py` and `quality_check.py` green, and
 (c) be verified by the execution-differential harness
 (`diff_harness.py`): the decompiled proto must return identical values
 to the original on the recorded inputs, including side-effect counts.

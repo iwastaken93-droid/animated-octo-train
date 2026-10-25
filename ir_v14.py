@@ -577,10 +577,10 @@ class Lifter:
 
             if n == "CAPTURE":
                 # stray CAPTURE (no NEWCLOSURE immediately before, e.g. after
-                # DUPCLOSURE flows) — keep as comment line for accounting
-                kind = op.CAPTURE_NAMES.get(A, str(A))
-                src = f"U{B}" if A == op.LCT_UPVAL else f"R{B}"
-                self._op(ins, f"-- capture {kind} {src}")
+                # DUPCLOSURE flows): upvalue binding has no Luau statement
+                # form, so it vanishes here (suppressed, like PREPVARARGS)
+                # instead of leaking as a `-- capture` comment.
+                self.res.suppressed.add(ins.pc)
                 i += 1
                 continue
 
@@ -702,8 +702,11 @@ class Lifter:
             if n == "SETUPVAL":
                 self._op(ins, f"{self._upval(B).render()} = {self._use(A).render()}"); i += 1; continue
             if n == "CLOSEUPVALS":
-                # no Luau statement; scope end handles it. comment keeps pc covered
-                self._op(ins, f"-- close R{A}.. (upvalues leave scope)"); i += 1; continue
+                # no Luau statement; scope end handles it. Vanishes
+                # (suppressed) instead of leaking as a `-- close` comment.
+                self.res.suppressed.add(ins.pc)
+                i += 1
+                continue
             if n == "GETIMPORT":
                 e = _leaf("import", self._import_path(D)); self._def(A, e)
                 self._op(ins, f"R{A} = {e.render()}"); i += 1; continue
@@ -785,8 +788,21 @@ class Lifter:
                 e = _leaf("table", tmpl)
                 self._def(A, e); self._op(ins, f"R{A} = {tmpl}{suffix}"); i += 1; continue
             if n == "DUPCLOSURE":
-                e = _leaf("closure", f"dupclosure {self._const(D).render()}")
-                self._def(A, e); self._op(ins, f"R{A} = dupclosure {self._const(D).render()}"); i += 1; continue
+                cname = self._const(D).render()
+                if not cname.strip():
+                    # anonymous child proto: the constant renders empty,
+                    # which would leak `dupclosure ` (two adjacent
+                    # expressions: unparseable). Fall back to an explicit
+                    # call on the child proto ref, same fiction level as
+                    # NEWCLOSURE's `P#`.
+                    try:
+                        cname = f"(P{self.proto.consts[D].value[1]})"
+                    except Exception:
+                        cname = f"(K{D})"
+                else:
+                    cname = f" {cname}"
+                e = _leaf("closure", f"dupclosure{cname}")
+                self._def(A, e); self._op(ins, f"R{A} = dupclosure{cname}"); i += 1; continue
             if n == "SETLIST":
                 count = C - 1
                 if C == 0:

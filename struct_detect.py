@@ -1,20 +1,22 @@
-"""Structurer CFG detection: graph setup, loop finding, and loop classification."""
+"""Structurer CFG detection: graph setup, loop finding, loop classification,
+and graph mutation (goto-target absorption, join splitting)."""
 from __future__ import annotations
 
-import re
 import sys
-from dataclasses import dataclass, field
 
-import parser_v14
-from cfg_v14 import Insn, Block, CFG, build_cfg, CFGError
-from disassembler_v14 import DisasmError, fmt_const
-from ir_v14 import Lifter, IRError
+from cfg_v14 import Block
 
-from struct_node import (StructError, FASTCALL_OPS, COND_OPS, Cond, taken_cond, Node, render_all, Loop, StructResult, _RDEF_RE, _RMULTI_LHS_RE, _RTOP_LHS_RE, _RFOR_BIND_RE, _RREF_RE, _RREF_RES, _PURE_DEF_OPS, _NEG)
+from struct_node import (FOR_OPS, FASTCALL_OPS, COND_OPS, Loop, StructResult)
 
 
 class DetectMixin:
-    """Graph/detection phase (mixed into Structurer; needs core run state)."""
+    """Graph/detection phase (mixed into Structurer; needs core run state).
+    Single owner of graph mutation: absorption and join-splitting live
+    here because they rewrite cfg/succ/bodies; emission only reads them."""
+
+    _SPLIT_BUDGET = 8  # max join-block duplications per proto
+    _SPLIT_GROWTH = 24  # max total blocks added by splitting per proto
+    _ABSORB_ROUNDS = 10  # body growth is monotone, bounded by proto size
 
     def _setup_graph(self) -> None:
         """(Re)build struct-graph derivations from self.cfg.blocks.
@@ -464,3 +466,316 @@ class DetectMixin:
             strict = pdom[b] - {b}
             if strict:
                 self.ipdom[b] = max(strict, key=lambda c: len(pdom[c]))
+    def _absorbable(self, latch: int) -> bool:
+        """Latch terminator is the loop's own test/back-jump (absorb it) rather
+        than body control flow (structure it as a branch)."""
+        B = {b.id: b for b in self.cfg.blocks}
+        last = B[latch].last
+        if last is None:
+            return True
+        if last.opname in ("FORNLOOP", "FORGLOOP", "JUMPBACK"):
+            return True
+        L0 = self.latch_loop.get(latch)
+        if (L0 is not None and L0.kind == "repeat" and last.opname in COND_OPS
+                and last.jump_target is not None
+                and self._jump_to(latch, last.jump_target, L0.header)):
+            return True
+        # single fallthrough straight back into the header: silent back-edge
+        return self.succ[latch] == [L0.header] if L0 is not None else False
+    def _join_kind(self, B: dict[int, Block], x: int, jn: int | None,
+                   stops: dict[int, str], latches: frozenset,
+                   confine: set[int] | None) -> str:
+        """Classify a block for loop-aware join search: 'jn' (target),
+        'term' (arm terminates here: return, break/continue stop, or an
+        absorbable latch which merge arms close with `continue`),
+        'fall' (outer merge point: candidate but never expanded through),
+        'rej' (done, confine-outside, un-emitted loop entry, dead end).
+        'exp' (plain flow-through)."""
+        if x == jn:
+            return "jn"
+        if x in self.res.done:
+            return "rej"
+        a = stops.get(x)
+        if a in ("break", "continue"):
+            # Stops terminate the arm regardless of confine: the arm
+            # build checks stops before confine too.
+            return "term"
+        if a == "fallthrough":
+            return "fall"
+        if confine is not None and x not in confine:
+            return "rej"
+        if x in self.loop_by_header or x in self.loop_by_prep:
+            return "rej"
+        if x in latches:
+            return "term" if self._absorbable(x) else "rej"
+        last = B[x].last if x in B else None
+        if last is not None and last.is_return:
+            return "term"
+        if not self.succ.get(x):
+            return "rej"
+        return "exp"
+    def _loop_join(self, cur: int, ss: list[int], stops: dict[int, str],
+                   latches: frozenset, confine: set[int] | None,
+                   budget: int = 1024) -> int | None:
+        """Loop-aware join for diamonds whose full-graph ipdom is None:
+        loop-around paths (through latches/headers that terminate the arm
+        as continue/break) defeat the post-dominator, but every
+        non-terminating in-confine path still joins. BFS both successors
+        with loop-back cuts, rank common blocks nearest-first, and take
+        the first where every path reaches it or terminates. None when no
+        such join exists (caller keeps the terminator/fallback path)."""
+        B = {b.id: b for b in self.cfg.blocks}
+        dists: list[dict[int, int]] = []
+        for s in ss:
+            # BFS with loop-back cuts; first-visit depth for ranking.
+            depth: dict[int, int] = {}
+            queue: list[tuple[int, int]] = [(s, 0)]
+            while queue and len(depth) < budget:
+                x, d = queue.pop(0)
+                if x in depth:
+                    continue
+                k = self._join_kind(B, x, None, stops, latches, confine)
+                if k == "rej":
+                    continue
+                depth[x] = d
+                if k == "exp":
+                    queue.extend((t, d + 1) for t in self.succ.get(x, []))
+            dists.append(depth)
+        if len(dists) < 2:
+            return None
+        common = [x for x in dists[0] if x in dists[1] and x != cur
+                  and x not in latches]
+        common.sort(key=lambda x: (max(dists[0][x], dists[1][x]),
+                                   min(dists[0][x], dists[1][x]), x))
+        for jn in common:
+            ok = True
+            for s in ss:
+                stack = [s]
+                seen: set[int] = set()
+                while stack and ok:
+                    if len(seen) > budget:
+                        ok = False
+                        break
+                    x = stack.pop()
+                    if x in seen:
+                        continue
+                    seen.add(x)
+                    k = self._join_kind(B, x, jn, stops, latches, confine)
+                    if k in ("jn", "term"):
+                        continue
+                    if k != "exp":
+                        ok = False
+                        break
+                    stack.extend(self.succ.get(x, []))
+                if not ok:
+                    break
+            if ok:
+                return jn
+        return None
+    def _reaches_avoiding(self, src: int, dst: int, avoid: int | None) -> bool:
+        """src reaches dst without passing through avoid (None = anywhere)."""
+        seen = {src}
+        stack = [src]
+        while stack:
+            x = stack.pop()
+            if x == dst:
+                return True
+            for t in self.succ.get(x, []):
+                if t != avoid and t not in seen:
+                    seen.add(t)
+                    stack.append(t)
+        return False
+    def _absorbable_into(self, x: int, host: Loop, roles: set[int],
+                           skip_drain: bool = False) -> bool:
+        """Whether block x may join host's loop body: header-dominated,
+        reachable from the header without passing the exit, able to drain
+        to the exit, and not a loop role (header/latch/prep/exit/FOR op)
+        owned by another loop."""
+        B = {b.id: b for b in self.cfg.blocks}
+        if x not in self.reachable or x in host.body or x in roles:
+            return False
+        last = B[x].last
+        if last is not None and last.opname in FOR_OPS:
+            return False
+        if not self._dominates(self._idom_map, host.header, x):
+            return False
+        if host.exit is None:
+            return False
+        if not self._reaches_avoiding(host.header, x, host.exit):
+            return False
+        # The block must drain out of the body: to the loop exit, or by
+        # returning from inside it (a return terminates the iteration).
+        if self._reaches_avoiding(x, host.exit, None):
+            return True
+        if skip_drain:
+            return True
+        return not self.succ.get(x) and last is not None and last.is_return
+    def _drain_tail(self, x: int, host: Loop, roles: set[int],
+                    want: set[int]) -> list[int] | None:
+        """Straight-line tail from x that drains properly: follow single
+        successors while each link passes every absorbability check except
+        drain itself (dominance, reachability, roles, FOR ops, preds confined
+        to the body plus the pulled region), stopping at the exit, a
+        rejoin with the body, or a terminal return. Returns the tail links
+        (excluding x), or None when the chain branches, loops, or leaks."""
+        B = {b.id: b for b in self.cfg.blocks}
+        tail: list[int] = []
+        seen = {x}
+        while True:
+            ss = self.succ.get(x, [])
+            if len(ss) != 1:
+                return None
+            y = ss[0]
+            if y in host.body or y in want:
+                return tail  # rejoins already-placed code: drained
+            if y == host.exit or y in seen:
+                return tail if y == host.exit else None
+            last = B[y].last if y in B else None
+            if (y not in self.reachable or y in roles or y == host.header
+                    or (last is not None and last.opname in FOR_OPS)
+                    or not self._dominates(self._idom_map, host.header, y)
+                    or not self._reaches_avoiding(host.header, y, host.exit)
+                    or any(p not in host.body and p not in want and p not in tail
+                           for p in self.pred.get(y, []) if p in self.reachable)):
+                return None
+            tail.append(y)
+            if not self.succ.get(y) and last is not None and last.is_return:
+                return tail
+            seen.add(y)
+            x = y
+    def _absorb_goto_targets(self) -> bool:
+        """One absorption round over the current goto edges. Returns True
+        when at least one block joined a loop body (caller re-structures;
+        growth is monotone so rounds terminate)."""
+        roles: set[int] = set()
+        for L in self.res.loops:
+            roles.add(L.header)
+            roles |= set(L.latches)
+            if L.prep is not None:
+                roles.add(L.prep)
+            if L.exit is not None:
+                roles.add(L.exit)
+        changed = False
+        for s, t in list(self.res.goto_edges):
+            if s < 0:
+                continue
+            # Host: the smallest loop the source is inside of (target
+            # outside), or the loop the target exits (source still outside
+            # the loop whose break-stop governs it, e.g. a late join).
+            host = None
+            for L in sorted(self.res.loops, key=lambda L: len(L.body)):
+                if t == L.exit and s not in L.body:
+                    host = L
+                    break
+                if s in L.body and t not in L.body:
+                    host = L
+                    break
+            if host is None and t == s:
+                # Self-edge from a confine-goto whose sub-build lost its
+                # caller (src defaults to the entry block itself): the
+                # true predecessor is unrecoverable from the edge, so host
+                # on the target's predecessors instead. When every
+                # reachable pred lives in one loop body, the target is a
+                # stray exit-path block (e.g. a straight-line run to a
+                # return) that structures inline once pulled in.
+                preds = [p for p in self.pred.get(t, [])
+                         if p in self.reachable]
+                if preds:
+                    for L in sorted(self.res.loops,
+                                   key=lambda L: len(L.body)):
+                        if (t not in L.body
+                                and all(p in L.body for p in preds)):
+                            host = L
+                            break
+            if host is None or host.exit is None:
+                continue
+            # closure: the outside endpoint (target, or the source when it
+            # is the one outside the host) plus predecessors back to the
+            # body; every link must be absorbable or the whole endpoint is
+            # refused (a partial pull would only relocate the goto).
+            fringe = [t if s in host.body else s]
+            want: set[int] = set()
+            ok = True
+            while fringe:
+                x = fringe.pop()
+                if x in host.body or x in want:
+                    continue
+                if not self._absorbable_into(x, host, roles):
+                    # Retry ignoring drain: x may head a straight-line
+                    # tail (e.g. an exit path running to a return) that
+                    # drains properly only as a whole.
+                    tail = (self._drain_tail(x, host, roles, want | {x})
+                            if self._absorbable_into(x, host, roles,
+                                                     skip_drain=True)
+                            else None)
+                    if tail is None:
+                        ok = False
+                        break
+                    want.add(x)
+                    want.update(tail)
+                    fringe.extend(self.pred.get(x, []))
+                    continue
+                want.add(x)
+                fringe.extend(self.pred.get(x, []))
+            if ok and want:
+                host.body |= want
+                changed = True
+        return changed
+    def _split_join_once(self) -> bool:
+        """Duplicate one leftover-goto join target per predecessor (first
+        predecessor keeps the original). Each copy has a single
+        predecessor, so `_build` structures it inline instead of emitting
+        `goto-join`. Only non-loop joins: the dst and all its reachable
+        predecessors must sit outside every detected loop role, since
+        copies would otherwise corrupt loop bodies. Returns True when a
+        split was made (caller refreshes derivations and restructures)."""
+        # Loop roles refuse: duplicating a header/latch/body block risks
+        # corrupting loop re-detection (copies share pcs, so new backedges
+        # could form). Loop-entangled joins stay on the dispatcher; the
+        # whiletrue multi-arm emit plus drain-tail absorption cover the
+        # convertible shapes instead.
+        looproles: set[int] = set()
+        for L in self.res.loops:
+            looproles.add(L.header)
+            looproles |= set(L.latches)
+            if L.prep is not None:
+                looproles.add(L.prep)
+            if L.exit is not None:
+                looproles.add(L.exit)
+            looproles |= set(L.body)
+        B = {b.id: b for b in self.cfg.blocks}
+        for dst in sorted({d for _, d in self.res.goto_edges}):
+            if dst not in B or dst in looproles:
+                continue
+            preds = [p for p in self.pred.get(dst, [])
+                     if p in self.reachable and p != dst]
+            preds = [p for p in preds if p not in looproles]
+            if len(preds) < 2:
+                continue
+            # Growth guard: duplication is the price of splitting, so
+            # total added blocks stay under _SPLIT_GROWTH. Wide joins
+            # (boolean soup like expr_torture) keep the compact
+            # dispatcher instead of exploding into copies.
+            if (len(self.cfg.blocks) - self._split_n0 + len(preds) - 1
+                    > self._SPLIT_GROWTH):
+                continue
+            orig = B[dst]
+            for p in preds[1:]:
+                newid = len(self.cfg.blocks)
+                copy = Block(id=newid, start_pc=orig.start_pc,
+                             insns=orig.insns,
+                             successors=list(orig.successors),
+                             predecessors=[p])
+                self.cfg.blocks.append(copy)
+                B[newid] = copy
+                self.succ[newid] = list(self.succ.get(dst, []))
+                self.succ[p] = [newid if x == dst else x
+                                for x in self.succ.get(p, [])]
+                for s in orig.successors:
+                    if s in B and newid not in B[s].predecessors:
+                        B[s].predecessors.append(newid)
+            orig.predecessors = [x for x in orig.predecessors
+                                 if x not in preds[1:]]
+            self._refresh_derived()
+            return True
+        return False

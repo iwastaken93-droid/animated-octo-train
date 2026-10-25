@@ -22,6 +22,7 @@ from __future__ import annotations
 import re
 
 import parser_v14
+from struct_node import compound_match
 from struct_v14 import Node, Structurer, render_all
 
 _RREF = re.compile(r"R(\d+)")
@@ -29,6 +30,7 @@ _LHS_MULTI = re.compile(r"^(R\d+(?:, R\d+)*) = ")
 _LHS_TOP = re.compile(r"^R(\d+)\.\.top = ")
 _LHS_TOP_RET = re.compile(r"^return R(\d+)\.\.top\s*$")
 _MRET_ARG = re.compile(r"\(\.\.\.multret@(\d+)\.\.\.\)")
+_NAMED_LHS = re.compile(r"^([A-Za-z_]\w*) = ")
 _FOR_BIND = re.compile(r"^for (R\d+(?:, R\d+)*) (?:=|in) ")
 
 
@@ -89,6 +91,31 @@ def _assigned_regs(nodes: list[Node]) -> set[int]:
                 if m:
                     for x in m.group(1).split(", "):
                         out.add(int(x[1:]))
+                else:
+                    mc = compound_match(nd.text)
+                    if mc:
+                        out.add(int(mc.group(1)))
+            if nd.then_:
+                walk(nd.then_)
+            if nd.else_:
+                walk(nd.else_)
+
+    walk(nodes)
+    return out
+
+
+def _named_assigned(nodes: list[Node]) -> set[str]:
+    """Renamed-register LHS identifiers (`players = ...`). `R#`/`U#`
+    writers are excluded: R# is covered by `_assigned_regs`, and a `U#`
+    write targets the caller's upvalue and must never become a local."""
+    out: set[str] = set()
+
+    def walk(lst: list[Node]) -> None:
+        for nd in lst:
+            if nd.kind == "stmt" and nd.text:
+                m = _NAMED_LHS.match(nd.text)
+                if m and not re.fullmatch(r"[RU]\d+", m.group(1)):
+                    out.add(m.group(1))
             if nd.then_:
                 walk(nd.then_)
             if nd.else_:
@@ -142,12 +169,17 @@ def render_function(bc: parser_v14.Bytecode, proto: parser_v14.Proto,
     for nd in nodes:
         _expand_node(nd, hi)
     assigned = _assigned_regs(nodes)
+    named = _named_assigned(nodes)
     params = [f"R{r}" for r in range(proto.numparams)]
     # Hoist every assigned non-param register, including for-bound ones:
     # a numeric-for index (e.g. `for R6 = R6, ...`) is assigned in the
     # prep and must stay a function-level local so the head init reads
     # the outer value; the for-statement itself opens an inner scope.
     locs = sorted(r for r in assigned if r >= proto.numparams)
+    # Renamed registers (`players = ...`) are function-level locals like
+    # the R# they replace: without a declaration they would execute as
+    # globals. Upvalue writes (`U0 = ...`) are excluded, never declared.
+    namelocs = sorted(named)
 
     dn = proto.debugname
     label = dn.decode("utf-8", "replace") if isinstance(dn, bytes) else (dn or "??")
@@ -161,8 +193,9 @@ def render_function(bc: parser_v14.Bytecode, proto: parser_v14.Proto,
     sig = ", ".join(params + (["..."] if proto.is_vararg else []))
     head.append(f"local function P{proto.id}({sig})")
     body: list[str] = []
-    if locs:
-        body.append("  local " + ", ".join(f"R{r}" for r in locs))
+    if locs or namelocs:
+        body.append("  local " + ", ".join(
+            [f"R{r}" for r in locs] + namelocs))
     body += ["  " + ln for ln in render_all(nodes)]
     body.append("end")
     return "\n".join(head + body), not bad_flow

@@ -1,7 +1,8 @@
+import re
 import sys, glob
 sys.path.insert(0, ".")
 import parser_v14
-from struct_v14 import Structurer
+from struct_v14 import Structurer, render_all, COND_OPS
 
 files = list(dict.fromkeys(sorted(glob.glob("fixtures/v14/*.luac")) + sorted(glob.glob("fixtures/v14/**/*.luac", recursive=True))))
 fails = 0; nprotos = 0
@@ -38,9 +39,6 @@ for f in files:
                     # self-edges absorbed silently are ok if block is a latch/header
                     print(f"EDGE {f} P{p.id}: {b}->{t} unclassified"); fails += 1
         # goto/label balance: every goto target structured (has label emitted somewhere)
-        rendered = "\n".join(n.render_text() if hasattr(n, 'render_text') else "" for n in [])
-        import re
-        from struct_v14 import render_all
         text = "\n".join(render_all(res.nodes))
         gotos = set(re.findall(r"goto (L\d+)", text))
         labels = set(re.findall(r"^\s*(L\d+):", text, re.M))
@@ -59,7 +57,6 @@ for f in files:
                 print(f"KIND {f} P{p.id}: {L.kind} latch={lop}"); fails += 1
             if L.kind == "repeat":
                 ins = st.cfg.blocks[L.latch].last
-                from struct_v14 import COND_OPS
                 if not (lop in COND_OPS or latches_ok):
                     print(f"KIND {f} P{p.id}: repeat latch={lop}"); fails += 1
         # determinism

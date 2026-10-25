@@ -1,20 +1,19 @@
-"""Structurer emission: statement expansion, loop rendering, edge helpers."""
+"""Structurer emission: statement expansion, loop/branch rendering,
+goto/label edges, and the dispatcher fallback."""
 from __future__ import annotations
 
-import re
-import sys
-from dataclasses import dataclass, field
+from cfg_v14 import Block
 
-import parser_v14
-from cfg_v14 import Insn, Block, CFG, build_cfg, CFGError
-from disassembler_v14 import DisasmError, fmt_const
-from ir_v14 import Lifter, IRError
-
-from struct_node import (StructError, FASTCALL_OPS, COND_OPS, Cond, taken_cond, Node, render_all, Loop, StructResult, _RDEF_RE, _RMULTI_LHS_RE, _RTOP_LHS_RE, _RFOR_BIND_RE, _RREF_RE, _RREF_RES, _PURE_DEF_OPS, _NEG)
+from struct_node import (FOR_OPS, StructError, COND_OPS, Cond, taken_cond,
+                         Node, Loop, _RDEF_RE,
+                         _RMULTI_LHS_RE, _RTOP_LHS_RE, _RFOR_BIND_RE,
+                         compound_match, _RREF_RE, _PURE_DEF_OPS)
 
 
 class EmitMixin:
-    """Emission phase (mixed into Structurer)."""
+    """Emission phase (mixed into Structurer). Single owner of rendered
+    output: statement expansion, loop/branch emission, goto/label edges,
+    and the whole-proto dispatcher fallback."""
 
     SKIP_OPS = COND_OPS | {"JUMP", "JUMPBACK", "JUMPX", "RETURN",
                            "FORNPREP", "FORNLOOP", "FORGLOOP",
@@ -46,6 +45,9 @@ class EmitMixin:
         m = _RMULTI_LHS_RE.match(text)
         if m:
             return [int(x[1:]) for x in m.group(1).split(", ")]
+        m = compound_match(text)
+        if m:
+            return [int(m.group(1))]
         m = _RTOP_LHS_RE.match(text)
         if m:
             return [int(m.group(1))]
@@ -53,10 +55,18 @@ class EmitMixin:
     @staticmethod
     def _value_refs(text: str) -> set[int]:
         """All R# read as *values*. Only the LHS occurrence itself is
-        excluded -- `R0 = R0 + 1` genuinely reads R0."""
+        excluded -- `R0 = R0 + 1` genuinely reads R0. A compound
+        `R0 += K` reads R0 too, so its LHS counts as a read."""
         m = _RMULTI_LHS_RE.match(text) or _RTOP_LHS_RE.match(text)
-        rhs = text[m.end():] if m else text
-        return {int(x) for x in _RREF_RE.findall(rhs)}
+        if m:
+            rhs = text[m.end():]
+            return {int(x) for x in _RREF_RE.findall(rhs)}
+        m = compound_match(text)
+        if m:
+            lhs = int(m.group(1))
+            rhs = text[m.end():]
+            return {lhs} | {int(x) for x in _RREF_RE.findall(rhs)}
+        return {int(x) for x in _RREF_RE.findall(text)}
     @staticmethod
     def _header_refs(header: str) -> set[int]:
         """Regs a loop header reads. The bound loop var(s) (`for R7 =`
@@ -90,6 +100,18 @@ class EmitMixin:
         return out
     def _edge(self, src: int, dst: int, kind: str) -> None:
         self.res.edges.append((src, dst, kind))
+    def _label_of(self, b: int) -> str:
+        if b not in self._labels:
+            self._labels[b] = f"L{len(self._labels)}"
+        return self._labels[b]
+    def _goto(self, dst: int, src: int | None = None) -> Node:
+        self._gotos.add(dst)
+        # Every goto emission is recorded with its source block (sweep
+        # roots have no predecessor; logged as -1) so elimination passes
+        # and the edge-coverage check see the complete set, not just the
+        # subset whose _build step happened to hold a predecessor.
+        self.res.goto_edges.append((src if src is not None else -1, dst))
+        return Node("goto", f"goto {self._label_of(dst)}")
     def _break_reaches_outer(self, target: int, stops: dict[int, str]) -> bool:
         """Would `break` (of the loop owning `stops`) land on `target`?
 
@@ -130,6 +152,139 @@ class EmitMixin:
                 seen.add(nxt)
                 cur = nxt
         return False
+    def _emit_term_if(self, out: list[Node], b: Block, prev: int | None,
+                      cur: int, cond: Cond, ss: list[int], arm: list[Node],
+                      negate: bool) -> int:
+        """Emit a terminator-style `if` for one arm and return the block
+        the frame continues at. Single owner for the four call sites."""
+        out += self._stmts(b)
+        if prev is not None:
+            self._edge(prev, cur, "seq-in")
+        if negate:
+            self._edge(cur, ss[1], "if-then-term")
+            self._edge(cur, ss[0], "if-else-inline")
+            out.append(Node("if", cond=cond.negate(), then_=arm, else_=[]))
+        else:
+            self._edge(cur, ss[0], "if-then-term")
+            self._edge(cur, ss[1], "if-else-inline")
+            out.append(Node("if", cond=cond, then_=arm, else_=[]))
+        self.res.stats["if-term"] = self.res.stats.get("if-term", 0) + 1
+        return ss[0] if negate else ss[1]
+    def _close_latch_arm(self, root: int, arm: list[Node],
+                         latches: frozenset) -> list[Node]:
+        """A side absorbed as the active loop latch loops back: the merge
+        point is not a join for it, so say continue instead of falling
+        through to a spurious action there. Single owner for the six
+        arm-closing sites."""
+        if (root in latches and self._absorbable(root) and not (
+                arm and arm[-1].kind in ("return", "goto", "break", "continue"))):
+            return list(arm) + [Node("continue", "continue")]
+        return arm
+    def _build_cond(self, out: list[Node], b: Block, prev: int | None,
+                    cur: int, stops: dict[int, str], latches: frozenset,
+                    confine: set[int] | None, cond: Cond,
+                    ss: list[int]) -> tuple[bool, int | None, int | None]:
+        """Structure one conditional diamond at cur: terminator-style ifs,
+        loop-aware join-merge, or the goto fallback. Returns (stop, prev,
+        cur): stop ends the current chunk, else the frame continues at cur.
+        Owns all branch policy so _build stays a traversal loop."""
+        m = self.ipdom.get(cur)
+        join_m: int | None = None
+        if m is None or m not in self.reachable:
+            # no join: try terminator-style `if C then <taken> end` when the
+            # taken region cannot fall through (early returns, breaks...).
+            # A taken side absorbed as the active loop latch continues the
+            # loop; a terminating else side works negated (swap sides).
+            _snap = self._take_run_snapshot()
+            n_edges, n_gedges = _snap[5], _snap[6]
+            then = self._close_latch_arm(
+                ss[0], self._build(ss[0], dict(stops), latches, confine),
+                latches)
+            # Goto-free terminator shapes keep their exact form; only
+            # strand-embedding (or unterminated) attempts reroute.
+            then_ok = (then and then[-1].kind in ("return", "goto", "break", "continue")
+                       and len(self.res.goto_edges) == n_gedges)
+            els_gotoy = False
+            if not (then and then[-1].kind in ("return", "goto", "break", "continue")):
+                self._restore_run_snapshot(_snap)
+                els = self._close_latch_arm(
+                    ss[1], self._build(ss[1], dict(stops), latches, confine),
+                    latches)
+                if (els and els[-1].kind in ("return", "goto", "break", "continue")
+                        and len(self.res.goto_edges) == n_gedges):
+                    prev, cur = cur, self._emit_term_if(
+                        out, b, prev, cur, cond, ss, els, True)
+                    return False, prev, cur
+                els_gotoy = bool(els and els[-1].kind in ("return", "goto", "break", "continue"))
+                self._restore_run_snapshot(_snap)
+            if then_ok:
+                prev, cur = cur, self._emit_term_if(
+                    out, b, prev, cur, cond, ss, then, False)
+                return False, prev, cur
+            # Strand-embedding or unterminated attempt: restore it and
+            # prefer a join continuation over the goto fallback.
+            self._restore_run_snapshot(_snap)
+            jn = self._loop_join(cur, ss, stops, latches, confine)
+            if jn is not None:
+                m = jn
+                join_m = jn
+                self.res.stats["joins-merged"] = self.res.stats.get("joins-merged", 0) + 1
+            elif then and then[-1].kind in ("return", "goto", "break", "continue"):
+                # Goto-y taken side, no join: rebuild this exact shape
+                # (_build is deterministic) and keep it verbatim.
+                then = self._close_latch_arm(
+                    ss[0], self._build(ss[0], dict(stops), latches, confine),
+                    latches)
+                prev, cur = cur, self._emit_term_if(
+                    out, b, prev, cur, cond, ss, then, False)
+                return False, prev, cur
+            elif els_gotoy:
+                els = self._close_latch_arm(
+                    ss[1], self._build(ss[1], dict(stops), latches, confine),
+                    latches)
+                prev, cur = cur, self._emit_term_if(
+                    out, b, prev, cur, cond, ss, els, True)
+                return False, prev, cur
+            else:
+                out += self._stmts(b)
+                self.res.stats["fallback-nomerge"] = self.res.stats.get("fallback-nomerge", 0) + 1
+                out.append(Node("stmt", f"if {cond.render()} then {self._goto(ss[0], cur).text}"))
+                self._edge(cur, ss[0], "goto-cond")
+                if prev is not None:
+                    self._edge(prev, cur, "seq-in")
+                self._edge(cur, ss[1], "seq")
+                prev, cur = cur, ss[1]
+                return False, prev, cur
+        if prev is not None:
+            self._edge(prev, cur, "merge-out")
+        self._edge(cur, ss[0], "if-then")
+        self._edge(cur, ss[1], "if-else")
+        out += self._stmts(b)
+        stops2 = dict(stops)
+        if m not in stops2:
+            stops2[m] = "fallthrough"
+        if join_m is not None:
+            self._merge_arm_depth += 1
+        try:
+            then = self._build(ss[0], stops2, latches, confine)
+            els = self._build(ss[1], stops2, latches, confine)
+        finally:
+            if join_m is not None:
+                self._merge_arm_depth -= 1
+        then = self._close_latch_arm(ss[0], then, latches)
+        els = self._close_latch_arm(ss[1], els, latches)
+        if not then and els:
+            cond, then, els = cond.negate(), els, then
+        out.append(Node("if", cond=cond, then_=then, else_=els))
+        term = ("return", "goto", "break", "continue")
+        if ((then and then[-1].kind in term)
+                and (els and els[-1].kind in term)):
+            # both sides terminate: nothing falls through to the merge
+            # (a latch side loops back); end the chunk instead of
+            # re-processing the merge into a spurious action.
+            return True, prev, cur
+        prev, cur = cur, m
+        return False, prev, cur
     def _build(self, entry: int | None, stops: dict[int, str], latches: frozenset = frozenset(),
                confine: set[int] | None = None) -> list[Node]:
         out: list[Node] = []
@@ -152,6 +307,12 @@ class EmitMixin:
                 out += self._stmts(b)
                 if prev is not None:
                     self._edge(prev, cur, "seq-in")
+                if self._merge_arm_depth:
+                    # Merge arms need an explicit loop-back: silent absorb
+                    # would fall off the arm into the merge continuation.
+                    out.append(Node("continue", "continue"))
+                    if prev is not None:
+                        self._edge(prev, cur, "continue-latch")
                 break
             # A body-entry that is itself an innermost latch must still be
             # structured (it carries body control flow); only OUTER latches
@@ -206,11 +367,45 @@ class EmitMixin:
                     self._edge(prev, cur, "goto")
                 break
             if confine is not None and cur not in confine and cur not in stops:
+                if cur not in self.res.done:
+                    last = B[cur].last if cur in B else None
+                    if (last is not None and last.is_return
+                            and not self.succ.get(cur)):
+                        # Return block just past the region edge (loop-exit
+                        # adjacent): inline it as the arm end instead of a
+                        # confine goto that can never anchor a label. The
+                        # arm terminates here; nothing falls through.
+                        self._anchors.setdefault(cur, (out, len(out)))
+                        self.res.done.add(cur)
+                        out += self._stmts(B[cur])
+                        if prev is not None:
+                            self._edge(prev, cur, "seq-in")
+                        break
                 out.append(self._goto(cur, prev if prev is not None else entry))
                 if prev is not None:
                     self._edge(prev, cur, "goto-confine")
                 break
             if cur in self.res.done:
+                s1 = self.succ.get(cur, [])
+                if (len(s1) == 1 and cur not in latches
+                        and cur not in self.latch_loop
+                        and cur not in self.loop_by_header
+                        and cur not in self.loop_by_prep
+                        and stops.get(s1[0]) in ("fallthrough", "break", "continue")):
+                    dup = self._stmts(B[cur])
+                    if len(dup) <= 3:
+                        # Cross-diamond shared arm already emitted elsewhere:
+                        # duplicate its few straight-line statements inline
+                        # (node-split in the emitter: no CFG growth) and run
+                        # the merge continuation instead of stranding. The
+                        # stop-guarded successor ends this arm, so no chain.
+                        out += dup
+                        if prev is not None:
+                            self._edge(prev, cur, "dup-inline")
+                        self._edge(cur, s1[0], "dup-flow")
+                        self.res.stats["dups-inlined"] = self.res.stats.get("dups-inlined", 0) + 1
+                        prev, cur = cur, s1[0]
+                        continue
                 out.append(self._goto(cur, prev if prev is not None else entry))
                 if prev is not None:
                     self._edge(prev, cur, "goto-join")
@@ -236,8 +431,6 @@ class EmitMixin:
             last = b.last
             if last is None or last.is_return:
                 out += self._stmts(b)
-                if prev is not None and prev != cur:
-                    pass
                 break
             ss = self.succ[cur]
             if len(ss) == 0:
@@ -263,115 +456,12 @@ class EmitMixin:
                 prev, cur = cur, ss[1]
                 continue
             cond = taken_cond(last, self.bc, self.proto)
-            m = self.ipdom.get(cur)
-            if m is None or m not in self.reachable:
-                # no join: try terminator-style `if C then <taken> end` when the
-                # taken region cannot fall through (early returns, breaks...).
-                # A taken side absorbed as the active loop latch continues the
-                # loop; a terminating else side works negated (swap sides).
-                _snap = (set(self.res.done), dict(self._anchors), set(self._emitted_loops),
-                         set(self._gotos), dict(self._labels), len(self.res.edges),
-                         len(self.res.goto_edges))
-                then = self._build(ss[0], dict(stops), latches, confine)
-                if ss[0] in latches and self._absorbable(ss[0]) and not (
-                        then and then[-1].kind in ("return", "goto", "break", "continue")):
-                    then = list(then) + [Node("continue", "continue")]
-                if not (then and then[-1].kind in ("return", "goto", "break", "continue")):
-                    (self.res.done, self._anchors, self._emitted_loops,
-                     self._gotos, self._labels, n_edges, n_gedges) = (
-                        _snap[0], _snap[1], _snap[2], _snap[3], _snap[4], _snap[5], _snap[6])
-                    del self.res.edges[n_edges:]
-                    del self.res.goto_edges[n_gedges:]
-                    els = self._build(ss[1], dict(stops), latches, confine)
-                    if ss[1] in latches and self._absorbable(ss[1]) and not (
-                            els and els[-1].kind in ("return", "goto", "break", "continue")):
-                        els = list(els) + [Node("continue", "continue")]
-                    if els and els[-1].kind in ("return", "goto", "break", "continue"):
-                        out += self._stmts(b)
-                        if prev is not None:
-                            self._edge(prev, cur, "seq-in")
-                        self._edge(cur, ss[1], "if-then-term")
-                        self._edge(cur, ss[0], "if-else-inline")
-                        out.append(Node("if", cond=cond.negate(), then_=els, else_=[]))
-                        self.res.stats["if-term"] = self.res.stats.get("if-term", 0) + 1
-                        prev, cur = cur, ss[0]
-                        continue
-                    (self.res.done, self._anchors, self._emitted_loops,
-                     self._gotos, self._labels, n_edges, n_gedges) = (
-                        _snap[0], _snap[1], _snap[2], _snap[3], _snap[4], _snap[5], _snap[6])
-                    del self.res.edges[n_edges:]
-                    del self.res.goto_edges[n_gedges:]
-                    then = []
-                if not then:
-                    # taken side empty (already structured): fall through to goto form
-                    pass
-                elif then[-1].kind in ("return", "goto", "break", "continue"):
-                    out += self._stmts(b)
-                    if prev is not None:
-                        self._edge(prev, cur, "seq-in")
-                    self._edge(cur, ss[0], "if-then-term")
-                    self._edge(cur, ss[1], "if-else-inline")
-                    out.append(Node("if", cond=cond, then_=then, else_=[]))
-                    self.res.stats["if-term"] = self.res.stats.get("if-term", 0) + 1
-                    prev, cur = cur, ss[1]
-                    continue
-                out += self._stmts(b)
-                self.res.stats["fallback-nomerge"] = self.res.stats.get("fallback-nomerge", 0) + 1
-                out.append(Node("stmt", f"if {cond.render()} then {self._goto(ss[0], cur).text}"))
-                self._edge(cur, ss[0], "goto-cond")
-                if prev is not None:
-                    self._edge(prev, cur, "seq-in")
-                self._edge(cur, ss[1], "seq")
-                prev, cur = cur, ss[1]
-                continue
-            if prev is not None:
-                self._edge(prev, cur, "merge-out")
-            self._edge(cur, ss[0], "if-then")
-            self._edge(cur, ss[1], "if-else")
-            out += self._stmts(b)
-            stops2 = dict(stops)
-            if m not in stops2:
-                stops2[m] = "fallthrough"
-            then = self._build(ss[0], stops2, latches, confine)
-            els = self._build(ss[1], stops2, latches, confine)
-            # A side absorbed as the active loop latch loops back: the
-            # merge point is not a join for it, so say continue instead
-            # of falling through to a spurious action there.
-            if ss[0] in latches and self._absorbable(ss[0]) and not (
-                    then and then[-1].kind in ("return", "goto", "break", "continue")):
-                then = list(then) + [Node("continue", "continue")]
-            if ss[1] in latches and self._absorbable(ss[1]) and not (
-                    els and els[-1].kind in ("return", "goto", "break", "continue")):
-                els = list(els) + [Node("continue", "continue")]
-            if not then and els:
-                cond, then, els = cond.negate(), els, then
-            out.append(Node("if", cond=cond, then_=then, else_=els))
-            term = ("return", "goto", "break", "continue")
-            if ((then and then[-1].kind in term)
-                    and (els and els[-1].kind in term)):
-                # both sides terminate: nothing falls through to the merge
-                # (a latch side loops back); end the chunk instead of
-                # re-processing the merge into a spurious action.
+            stop, prev, cur = self._build_cond(
+                out, b, prev, cur, stops, latches, confine, cond, ss)
+            if stop:
                 break
-            prev, cur = cur, m
             continue
         return out
-    def _absorbable(self, latch: int) -> bool:
-        """Latch terminator is the loop's own test/back-jump (absorb it) rather
-        than body control flow (structure it as a branch)."""
-        B = {b.id: b for b in self.cfg.blocks}
-        last = B[latch].last
-        if last is None:
-            return True
-        if last.opname in ("FORNLOOP", "FORGLOOP", "JUMPBACK"):
-            return True
-        L0 = self.latch_loop.get(latch)
-        if (L0 is not None and L0.kind == "repeat" and last.opname in COND_OPS
-                and last.jump_target is not None
-                and self._jump_to(latch, last.jump_target, L0.header)):
-            return True
-        # single fallthrough straight back into the header: silent back-edge
-        return self.succ[latch] == [L0.header] if L0 is not None else False
     def _log_loop_edges(self, L: Loop) -> None:
         B = {b.id: b for b in self.cfg.blocks}
         if L.prep is not None:
@@ -488,6 +578,30 @@ class EmitMixin:
             return pre + [Node("while", cond=cond, then_=body)]
         if L.kind == "whiletrue":
             top = [] if L.header == L.latch else self._stmts(B[L.header])
+            others = [t for t in self.succ.get(L.header, [])
+                      if t != L.body_entry and t != L.exit]
+            if others and len(self.succ.get(L.header, [])) == 2:
+                # The header was pre-marked done above (old path absorbs
+                # it); this path structures it, so unmark for the frame.
+                self.res.done.discard(L.header)
+                # Header fans out to two body regions: the non-entry arm
+                # would never be traversed (it is not the exit either),
+                # stranding it for the context-free sweep as gotos to the
+                # latch. Start the body frame at the header itself (the
+                # first-visit rule bypasses its own continue-stop) so the
+                # header's branch goes through the standard ipdom-merge
+                # above: both arms plus the join continuation, latch
+                # sides as `continue`, all with loop stops.
+                for arm in self.succ[L.header]:
+                    self._edge(L.header, arm, "loop-inner"
+                               if arm in L.body else "loop-exit")
+                # prefix=None: the frame structures the header itself
+                # (its stmts emit once in the diamond paths below); the
+                # old `top` prefix would emit them a second time.
+                body = self._loop_body(L, prefix=None, start=L.header)
+                self._edge(L.latch, L.header, "loop-back")
+                return pre + [Node("while", cond=Cond("truthy", "true"),
+                                        then_=body)]
             self.res.done.add(L.header)
             self._edge(L.header, L.body_entry, "loop-entry")
             body = self._loop_body(L, prefix=top)
@@ -512,14 +626,16 @@ class EmitMixin:
             self._edge(L.latch, L.exit, "loop-exit")
             return pre + [Node("repeat", cond=cond, then_=body)]
         raise StructError(f"unknown loop kind {L.kind}")
-    def _loop_body(self, L: Loop, prefix: list[Node] | None = None) -> list[Node]:
+    def _loop_body(self, L: Loop, prefix: list[Node] | None = None,
+                   start: int | None = None) -> list[Node]:
         stops: dict[int, str] = {}
         if L.exit is not None:
             stops[L.exit] = "break"
         stops[L.header] = "continue"
         self._latch_stack.append(L.latches)
         try:
-            body = self._build(L.body_entry, stops, L.latches, set(L.body))
+            body = self._build(start if start is not None else L.body_entry,
+                               stops, L.latches, set(L.body))
         finally:
             self._latch_stack.pop()
         if not prefix:
@@ -534,3 +650,71 @@ class EmitMixin:
         return combined
     def _after_loop(self, L: Loop) -> int | None:
         return L.exit
+    def _apply_dispatcher(self) -> bool:
+        """Whole-proto pc-dispatcher over reachable blocks. Valid Luau by
+        construction (no labels/gotos): each block's straight-line stmts
+        run under `if _pc == N`, transfers assign _pc. Faithful: it is the
+        CFG itself. Requires no FOR loop ops (their init semantics live in
+        _emit_loop); refuses otherwise, leaving the proto excluded.
+        Returns True when the dispatcher was emitted."""
+        B = {b.id: b for b in self.cfg.blocks}
+        for b in self.reachable:
+            last = B[b].last
+            if last is not None and last.opname in FOR_OPS:
+                self.res.stats["tier"] = "dispatcher-refused-for"
+                return False
+        order = sorted(self.reachable, key=lambda x: B[x].start_pc)
+        chain: list[Node] = [Node("break", "break")]  # unknown _pc: exit
+        for b in reversed(order):
+            body = self._stmts(B[b])
+            returns = bool(body) and body[-1].kind == "return"
+            ss = self.succ.get(b, [])
+            if not returns:
+                if len(ss) == 1:
+                    body.append(Node("stmt", f"_pc = {ss[0]}"))
+                elif len(ss) == 2:
+                    last = B[b].last
+                    if last is None or last.opname not in COND_OPS:
+                        self.res.stats["tier"] = "dispatcher-refused-shape"
+                        return False
+                    cond = taken_cond(last, self.bc, self.proto)
+                    body.append(Node(
+                        "if", cond=cond,
+                        then_=[Node("stmt", f"_pc = {ss[0]}")],
+                        else_=[Node("stmt", f"_pc = {ss[1]}")]))
+                elif len(ss) == 0:
+                    # no successor without a return: cannot happen per
+                    # codegen; break rather than spin.
+                    body.append(Node("break", "break"))
+                else:
+                    self.res.stats["tier"] = "dispatcher-refused-shape"
+                    return False
+            for src, dst in [(b, t) for t in ss]:
+                self._edge(src, dst, "dispatch")
+            eq = Cond("==", "_pc", str(b))
+            chain = [Node("if", cond=eq, then_=body, else_=chain)]
+        disp = [Node("stmt", f"local _pc = {self.cfg.entry}"),
+                Node("while", cond=Cond("truthy", "true"), then_=chain)]
+        self._dce(disp)
+        self.res.nodes = disp
+        self.res.goto_edges = []
+        self._gotos = set()
+        # Loops are intentionally not structured in dispatcher mode (the
+        # dispatcher interprets the CFG directly), so detection leftovers
+        # must not count as unclassified.
+        self.res.unclassified = []
+        self.res.done = set(self.reachable)
+        kinds: dict[str, int] = {}
+        for L in self.res.loops:
+            kinds[L.kind] = kinds.get(L.kind, 0) + 1
+        edgekinds: dict[str, int] = {}
+        for _, _, k in self.res.edges:
+            edgekinds[k] = edgekinds.get(k, 0) + 1
+        self.res.stats = {
+            "loops": kinds, "edges": edgekinds,
+            "unclassified": len(self.res.unclassified),
+            "gotos": 0, "tier": "dispatcher",
+            "done": len(self.res.done), "reachable": len(self.reachable),
+            "skipped": len(self.res.skipped),
+        }
+        return True

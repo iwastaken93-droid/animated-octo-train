@@ -5,7 +5,6 @@ One of five structurer modules; start at struct_v14.py for the pipeline overview
 from __future__ import annotations
 
 import re
-import sys
 from dataclasses import dataclass, field
 
 import parser_v14
@@ -15,6 +14,12 @@ from ir_v14 import Lifter, IRError
 
 _RDEF_RE = re.compile(r"^R(\d+) = ")
 _RMULTI_LHS_RE = re.compile(r"^(R\d+(?:, R\d+)*) = ")
+_RCOMPOUND_RE = re.compile(r"^R(\d+)\s*(?:\+=|-=|\*=|/=|//=|%=|\^=|\.\.=)")
+def compound_match(text: str):
+    """Match a `R# <op>= ...` compound-assign line, else None. Single
+    owner of the compound LHS shape: struct_emit, emit_v14 and
+    struct_sweep all go through here instead of owning copies."""
+    return _RCOMPOUND_RE.match(text)
 _RTOP_LHS_RE = re.compile(r"^R(\d+)\.\.top = ")
 _RFOR_BIND_RE = re.compile(r"^for (R\d+(?:, R\d+)*) (=|in) ")
 _RREF_RE = re.compile(r"R(\d+)")
@@ -30,6 +35,9 @@ COND_OPS = {
     "JUMPXEQKNIL", "JUMPXEQKB", "JUMPXEQKN", "JUMPXEQKS",
     "CMPPROTO",
 }
+FOR_OPS = frozenset({
+    "FORNPREP", "FORNLOOP", "FORGLOOP",
+    "FORGPREP", "FORGPREP_NEXT", "FORGPREP_INEXT"})
 _CMP_OPS = {
     "JUMPIFEQ": "==", "JUMPIFLE": "<=", "JUMPIFLT": "<",
     "JUMPIFNOTEQ": "~=", "JUMPIFNOTLE": ">", "JUMPIFNOTLT": ">=",
@@ -43,9 +51,17 @@ class Cond:
     r: str = ""
 
     def negate(self) -> "Cond":
+        # Compound conditions are only built by late sweep passes (guard
+        # merging), which never negate; fail fast if that changes.
+        if self.op in ("or", "and"):
+            raise StructError(f"cannot negate compound cond: {self.render()}")
         return Cond(_NEG[self.op], self.l, self.r)
 
     def render(self) -> str:
+        if self.op == "or":
+            return f"({self.l}) or ({self.r})"
+        if self.op == "and":
+            return f"({self.l}) and ({self.r})"
         if self.op == "truthy":
             return self.l
         if self.op == "falsy":

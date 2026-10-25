@@ -5,25 +5,31 @@ ir_v14 lifts each pc to a source line -> this package classifies loops/branches
 and emits structured pseudo-Luau. Split into modules by phase:
 
 - struct_node: shared representation (Cond, Node, Loop, StructResult, render_all)
-- struct_detect: CFG setup, loop finding, loop classification
-- struct_emit: statement expansion and loop/branch emission
-- struct_sweep: DCE, label/goto resolution, structuring sweeps, dispatcher
+- struct_detect: CFG setup, loop finding/classification, graph mutation
+  (goto-target absorption, join splitting)
+- struct_emit: statement expansion, loop/branch emission, goto/label
+  edges, dispatcher fallback
+- struct_sweep_{util,dce,branch,value,reg}: concern-owned sweep mixins
+  (shared traversal/text policy, deletion, branch-shape, value/expression,
+  register-alias)
+- struct_sweep: postpass coordinator (fixpoint driver) composing the
+  sweep mixins
+- struct_sweep_name: usage-evidence rename of single-def registers (default on)
 - struct_v14 (this file): Structurer composition, entry points, CLI self-test
 
 External imports stay ``from struct_v14 import ...``; names are re-exported below.
 """
 from __future__ import annotations
 
-import re
 import sys
-from dataclasses import dataclass, field
 
 import parser_v14
-from cfg_v14 import Insn, Block, CFG, build_cfg, CFGError
-from disassembler_v14 import DisasmError, fmt_const
+from cfg_v14 import build_cfg, CFGError
+from disassembler_v14 import DisasmError
 from ir_v14 import Lifter, IRError
 
-from struct_node import (StructError, FASTCALL_OPS, COND_OPS, Cond, taken_cond, Node, render_all, Loop, StructResult, _RDEF_RE, _RMULTI_LHS_RE, _RTOP_LHS_RE, _RFOR_BIND_RE, _RREF_RE, _RREF_RES, _PURE_DEF_OPS, _NEG)
+from struct_node import (StructError, FASTCALL_OPS, COND_OPS, Cond, taken_cond,
+                         Node, render_all, Loop, StructResult)
 from struct_detect import DetectMixin
 from struct_emit import EmitMixin
 from struct_sweep import SweepMixin
@@ -32,9 +38,11 @@ from struct_sweep import SweepMixin
 class Structurer(DetectMixin, EmitMixin, SweepMixin):
     """Composes the phase mixins; run state is set up by __init__/_reset_run_state."""
 
-    def __init__(self, bc: parser_v14.Bytecode, proto: parser_v14.Proto):
+    def __init__(self, bc: parser_v14.Bytecode, proto: parser_v14.Proto,
+                 names: bool = True):
         self.bc = bc
         self.proto = proto
+        self._want_names = names
         self.cfg = build_cfg(proto.code)
         if not self.cfg.insns:
             raise StructError("empty code")
@@ -45,15 +53,41 @@ class Structurer(DetectMixin, EmitMixin, SweepMixin):
         self._idom_map = {}  # current-graph idom for absorption
         self._setup_graph()
     def _reset_run_state(self) -> None:
+        # Fresh per-run output state: absorption re-runs structure on the
+        # same graph (loops/bodies persist, emission restarts from scratch).
         self._labels = {}
         self._emitted_loops = set()  # id(loop)
         self._gotos = set()
         self._latch_stack = []
         self._anchors = {}  # block -> (node list, index)
+        self._merge_arm_depth = 0  # >0 inside join-merge arm builds
         self._nodes = []
+        self.res.done = set()
+        self.res.goto_edges = []
+        self.res.edges = []
+        self.res.nodes = []
+        self._stops = {}
+    def _take_run_snapshot(self) -> tuple:
+        """Capture mutable run state for one speculative _build attempt.
+        Single owner (with _reset_run_state/_restore_run_snapshot) so
+        emission frames never hand-roll the snapshot tuple."""
+        return (set(self.res.done), dict(self._anchors), set(self._emitted_loops),
+                set(self._gotos), dict(self._labels), len(self.res.edges),
+                len(self.res.goto_edges))
+    def _restore_run_snapshot(self, snap: tuple) -> None:
+        """Restore a run snapshot with copies: rebinding alone aliases
+        the snap set, so post-restore marks would corrupt later restores
+        to the same snapshot."""
+        (self.res.done, self._anchors, self._emitted_loops,
+         self._gotos, self._labels, n_edges, n_gedges) = (
+            set(snap[0]), dict(snap[1]), set(snap[2]),
+            set(snap[3]), dict(snap[4]), snap[5], snap[6])
+        del self.res.edges[n_edges:]
+        del self.res.goto_edges[n_gedges:]
 
-def structure_proto(bc: parser_v14.Bytecode, proto: parser_v14.Proto) -> StructResult:
-    return Structurer(bc, proto).structure()
+def structure_proto(bc: parser_v14.Bytecode, proto: parser_v14.Proto,
+                    names: bool = True) -> StructResult:
+    return Structurer(bc, proto, names=names).structure()
 def render_struct(res: StructResult, bc: parser_v14.Bytecode, proto: parser_v14.Proto) -> str:
     dn = proto.debugname
     label = dn.decode("utf-8", "replace") if isinstance(dn, bytes) else (dn or "??")
@@ -65,6 +99,8 @@ if __name__ == "__main__":
     raw = sys.argv[1:]
     args: list[str] = []
     only = None
+    want_names = "--no-names" not in raw
+    raw = [a for a in raw if a not in ("--names", "--no-names")]
     skip_next = False
     for k, a in enumerate(raw):
         if skip_next:
@@ -85,7 +121,7 @@ if __name__ == "__main__":
             for p in bc.protos:
                 if only is not None and p.id != only:
                     continue
-                res = structure_proto(bc, p)
+                res = structure_proto(bc, p, names=want_names)
                 print(f"== {f} Function {p.id} ==")
                 print(render_struct(res, bc, p))
                 print()
